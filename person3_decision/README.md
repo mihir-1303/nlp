@@ -2,22 +2,41 @@
 
 ## What it does
 
-This first version compares sourcing scenarios for one order using operational
-values explicitly supplied by the caller. It evaluates continuing with the
-current supplier, switching the full order to each alternative, and any
-split-order allocations explicitly supplied to `evaluate_order`.
+This version includes a separate NLP incident-classification section and
+compares sourcing scenarios for one order using operational values explicitly
+supplied by the caller. It evaluates continuing with the current supplier,
+switching the full order to each alternative, and any split-order allocations
+explicitly supplied to `evaluate_order`.
 
 The recommendation policy is **cost-only**, not risk-aware. The engine does
 not predict disruption probability, estimate residual risk, require Person 2's
 model, or consume Person 1's NLP classifier confidence. Residual risk is always
 reported as `not_assessed`.
 
+## Incident analysis (NLP)
+
+The dashboard's **Incident Analysis (NLP)** section accepts an incident
+description and uses Person 1's saved scikit-learn event-classification
+pipeline at
+`person1_nlp/models/supply_chain_event_pipeline.joblib`. The path is resolved
+relative to `person3_decision/app.py`, and Streamlit caches the loaded model
+resource. The pipeline returns an event category such as `Weather`; it does
+not return disruption probability. The category is displayed separately and
+does not alter supplier inputs, scenario costs, or recommendations.
+
+For example, the synthetic/example text
+`Heavy rainfall caused flooding and delayed transportation.` is expected to
+be classified as `Weather` by the saved artifact. This label describes the
+classifier output only; it is not a risk score or a claim about operational
+impact.
+
 ## Requirements and execution
 
 - Python 3.10 or later (the repository's selected interpreter is Python 3.13).
 - The decision engine and tests use only the standard library.
-- The dashboard requires Streamlit; it is available in the selected workspace
-  environment.
+- The dashboard requires Streamlit, joblib, and the scikit-learn version
+  compatible with the saved pipeline; these are available in the selected
+  workspace environment.
 
 From the repository root, run the standard-library test suite with:
 
@@ -178,6 +197,12 @@ print(result.recommendation.scenario_id)
 
 ## Limitations and future integration
 
+- The NLP model classifies incident text into event categories only. It does
+  not estimate disruption probability, severity, supplier impact, or residual
+  risk, and it does not change the cost-only supplier recommendation.
+- The dashboard requires the saved model artifact at the documented relative
+  path. Missing or unreadable artifacts and inference failures are displayed
+  to the user; the model is not retrained by the dashboard.
 - The repository currently has no operational supplier, order, inventory,
   demand, route, or cost dataset. Real recommendations require validated
   values supplied to this interface.

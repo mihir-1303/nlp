@@ -84,7 +84,7 @@ class DashboardSplitModeTests(unittest.TestCase):
             any(item.label.startswith("Split quantity") for item in app.text_input)
         )
 
-        app.button[0].click()
+        app.button(key="evaluate_scenarios_button").click()
         app.run(timeout=15)
 
         self.assertFalse(app.exception)
@@ -99,7 +99,7 @@ class DashboardSplitModeTests(unittest.TestCase):
         app.text_input(key="split_1").set_value("5")
         app.text_input(key="split_2").set_value("5")
 
-        app.button[0].click()
+        app.button(key="evaluate_scenarios_button").click()
         app.run(timeout=15)
 
         self.assertFalse(app.exception)
@@ -114,7 +114,7 @@ class DashboardSplitModeTests(unittest.TestCase):
         app.text_input(key="split_1").set_value("2")
         app.text_input(key="split_2").set_value("2")
 
-        app.button[0].click()
+        app.button(key="evaluate_scenarios_button").click()
         app.run(timeout=15)
 
         self.assertFalse(app.exception)

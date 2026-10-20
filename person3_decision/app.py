@@ -1,16 +1,17 @@
-"""Streamlit dashboard for manually supplied sourcing scenarios.
+"""Streamlit dashboard for incident classification and sourcing scenarios.
 
-The dashboard does not load project datasets or model artifacts. All
-operational values are entered by the user, and recommendations remain
-cost-only with residual disruption risk unassessed.
+Operational values are entered by the user, and supplier recommendations
+remain cost-only with residual disruption risk unassessed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Sequence
+from pathlib import Path
+from typing import Protocol, Sequence
 
+import joblib
 import streamlit as st
 
 from person3_decision.decision_engine import (
@@ -22,6 +23,59 @@ from person3_decision.decision_engine import (
     SupplierOption,
     evaluate_order,
 )
+
+EVENT_CLASSIFIER_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "person1_nlp"
+    / "models"
+    / "supply_chain_event_pipeline.joblib"
+)
+
+
+class EventClassifier(Protocol):
+    """Prediction interface used by the saved event-classification pipeline."""
+
+    def predict(self, texts: list[str]) -> Sequence[str]: ...
+
+
+@st.cache_resource
+def load_event_classifier() -> EventClassifier:
+    """Load the saved Person 1 event classifier once per Streamlit process."""
+
+    if not EVENT_CLASSIFIER_PATH.is_file():
+        raise FileNotFoundError(
+            f"Event classifier model not found: {EVENT_CLASSIFIER_PATH}"
+        )
+
+    try:
+        return joblib.load(EVENT_CLASSIFIER_PATH)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not load event classifier model at "
+            f"{EVENT_CLASSIFIER_PATH}: {exc}"
+        ) from exc
+
+
+def classify_incident(
+    description: str,
+    model: EventClassifier | None = None,
+) -> str:
+    """Return one event category without deriving a risk score or probability."""
+
+    if not description.strip():
+        raise ValueError("Enter an incident description before classifying it.")
+
+    classifier = model if model is not None else load_event_classifier()
+    try:
+        predictions = classifier.predict([description.strip()])
+        if len(predictions) != 1:
+            raise ValueError("The classifier did not return exactly one category.")
+        category = str(predictions[0]).strip()
+        if not category:
+            raise ValueError("The classifier returned an empty event category.")
+        return category
+    except Exception as exc:
+        raise RuntimeError(f"Incident classification failed: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -396,6 +450,40 @@ def main() -> None:
         "user-provided/demo inputs and are not verified project or supplier data."
     )
 
+    st.subheader("Incident Analysis (NLP)")
+    st.caption(
+        "Classifies the incident text into an event category only. "
+        "This result does not represent disruption probability or risk and "
+        "does not affect supplier recommendations."
+    )
+    with st.form("incident_analysis_form"):
+        incident_description = st.text_area(
+            "Incident description",
+            key="incident_description",
+            placeholder="Describe the reported supply-chain incident",
+        )
+        classify_submitted = st.form_submit_button(
+            "Classify incident",
+            key="classify_incident_button",
+        )
+
+    if classify_submitted:
+        st.session_state["incident_analysis_result"] = None
+        st.session_state["incident_analysis_error"] = None
+        try:
+            st.session_state["incident_analysis_result"] = classify_incident(
+                incident_description
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            st.session_state["incident_analysis_error"] = str(exc)
+
+    incident_error = st.session_state.get("incident_analysis_error")
+    incident_result = st.session_state.get("incident_analysis_result")
+    if incident_error:
+        st.error(incident_error)
+    elif incident_result:
+        st.success(f"Predicted event category: {incident_result}")
+
     with st.sidebar:
         st.header("Scenario setup")
         alternative_count = st.number_input(
@@ -513,6 +601,7 @@ def main() -> None:
             "Evaluate scenarios",
             type="primary",
             use_container_width=True,
+            key="evaluate_scenarios_button",
         )
 
     if submitted:
