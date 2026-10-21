@@ -1,0 +1,10 @@
+# Raw supply-chain dataset
+supply-chain-prediction/DataCoSupplyChainDataset.csv
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
