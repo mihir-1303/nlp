@@ -16,13 +16,24 @@ import streamlit as st
 
 from person3_decision.decision_engine import (
     Constraints,
+    DecisionPolicy,
     DecisionResult,
     EvaluationInput,
+    IncidentAssociationStatus,
+    IncidentRiskContext,
     OrderInput,
+    RecommendationStatus,
     ScenarioResult,
     SupplierOption,
     evaluate_order,
 )
+from person3_decision.late_delivery_prediction import (
+    CATEGORICAL_FEATURES,
+    DEFAULT_WARNING_THRESHOLD,
+    NUMERIC_FEATURES,
+    predict_late_delivery,
+)
+from person3_decision.risk_scoring import RiskAssessment, score_incident
 
 EVENT_CLASSIFIER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -76,6 +87,25 @@ def classify_incident(
         return category
     except Exception as exc:
         raise RuntimeError(f"Incident classification failed: {exc}") from exc
+
+
+def _build_incident_risk_context(
+    assessment: RiskAssessment | None,
+    association_confirmed: bool,
+) -> IncidentRiskContext | None:
+    """Represent user-confirmed or unlinked incident context without ranking it."""
+
+    if assessment is None:
+        return None
+    association_status = (
+        IncidentAssociationStatus.USER_CONFIRMED
+        if association_confirmed
+        else IncidentAssociationStatus.UNLINKED
+    )
+    return IncidentRiskContext(
+        association_status=association_status,
+        risk_assessment=assessment,
+    )
 
 
 @dataclass(frozen=True)
@@ -313,6 +343,7 @@ def _build_evaluation(
     approved_supplier_ids_text: str,
     max_suppliers_enabled: bool,
     max_suppliers: int,
+    incident_context: IncidentRiskContext | None = None,
 ) -> EvaluationInput:
     """Build engine input using only entered values and enabled constraints."""
 
@@ -362,6 +393,7 @@ def _build_evaluation(
         current_supplier=current_supplier,
         alternative_suppliers=tuple(alternative_suppliers),
         constraints=constraints,
+        incident_context=incident_context,
     )
 
 
@@ -386,6 +418,75 @@ def _build_split_allocations(
     return (allocation,)
 
 
+def _render_late_delivery_prediction() -> None:
+    """Render a standalone late-delivery prediction form and result."""
+
+    st.subheader("Late-delivery prediction (order-time inputs)")
+    st.caption(
+        "This saved model estimates the dataset target Late_delivery_risk for "
+        "the supplied order attributes. It is separate from incident "
+        "classification, the heuristic incident-risk index, supplier-risk "
+        "estimates, and the supplier decision policy."
+    )
+    st.caption(
+        "The 0.4 default is a selected prototype operating threshold, not a "
+        "calibrated probability cutoff or a proven business optimum. This "
+        "late-delivery estimate is not a general supply-chain disruption "
+        "probability and is not linked to an incident or supplier."
+    )
+
+    input_features = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+    with st.form("late_delivery_prediction_form"):
+        columns = st.columns(2)
+        order_attributes: dict[str, str] = {}
+        for index, feature in enumerate(input_features):
+            with columns[index % 2]:
+                order_attributes[feature] = st.text_input(
+                    feature,
+                    key=f"late_delivery_input_{index}",
+                )
+        warning_threshold = st.number_input(
+            "Prototype warning threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=DEFAULT_WARNING_THRESHOLD,
+            step=0.05,
+            format="%.2f",
+            key="late_delivery_warning_threshold",
+        )
+        submitted = st.form_submit_button(
+            "Predict late-delivery probability",
+            key="late_delivery_prediction_button",
+        )
+
+    if not submitted:
+        return
+
+    try:
+        prediction = predict_late_delivery(
+            order_attributes,
+            warning_threshold=warning_threshold,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        st.error(f"Late-delivery prediction unavailable: {exc}")
+        return
+
+    st.metric(
+        "Predicted Late_delivery_risk probability",
+        f"{prediction.probability:.1%}",
+    )
+    if prediction.warning:
+        st.warning(
+            "Late-delivery estimate meets or exceeds the selected "
+            f"{prediction.warning_threshold:.2f} prototype threshold."
+        )
+    else:
+        st.info(
+            "Late-delivery estimate is below the selected "
+            f"{prediction.warning_threshold:.2f} prototype threshold."
+        )
+
+
 def _render_results(
     result: DecisionResult,
     currency: str,
@@ -393,11 +494,72 @@ def _render_results(
 ) -> None:
     """Display recommendation outcome and all evaluated scenarios."""
 
+    st.subheader("Incident context (informational only)")
+    incident_context = result.incident_context
+    if incident_context is None:
+        st.write("No incident risk context was supplied for this evaluation.")
+    else:
+        if (
+            incident_context.association_status
+            is IncidentAssociationStatus.USER_CONFIRMED
+        ):
+            st.write(
+                "Association: user-confirmed for this evaluation; "
+                "not verified by a project-data link."
+            )
+        else:
+            st.write("Association: unlinked; not confirmed for this evaluation.")
+
+        assessment = incident_context.risk_assessment
+        if assessment is None or assessment.score is None:
+            st.warning("Risk index: Unassessed; do not interpret this as low risk.")
+        else:
+            st.write(
+                f"Risk index: {assessment.score}/100 - "
+                f"{assessment.level.value} (heuristic)"
+            )
+        if assessment is not None:
+            for note in assessment.notes:
+                st.caption(note)
+    st.caption(
+        "Incident context is carried with the evaluation for traceability only; "
+        "it does not affect supplier feasibility, costs, or recommendation ranking."
+    )
+    prediction = result.disruption_prediction
+    st.warning(
+        "Operational disruption prediction: "
+        f"{prediction.status.value.capitalize()}."
+    )
+    st.write(prediction.reason)
+    st.caption(
+        "This status is separate from event-category classification and the "
+        "heuristic incident risk index."
+    )
+    with st.expander("Data required to enable operational prediction"):
+        for requirement in prediction.required_data:
+            st.markdown(f"- {requirement}")
+    if (
+        result.recommendation_status
+        is RecommendationStatus.RISK_COMPARISON_UNAVAILABLE
+    ):
+        st.warning(
+            "Risk-aware comparison unavailable; no risk-adjusted winner was selected."
+        )
+        if not result.has_feasible_scenario:
+            st.warning(
+                "No supplier scenario is confirmed feasible under the supplied "
+                "constraints."
+            )
+        st.write("Scenario risk contribution: unavailable (not comparable).")
+        for reason in result.risk_comparison_reasons:
+            st.caption(reason)
+
     st.subheader("Recommendation")
     recommendation = result.recommendation
-    if recommendation.scenario_id is None:
-        st.warning(recommendation.explanation)
-    else:
+    if (
+        result.recommendation_status
+        is RecommendationStatus.COST_ONLY_RECOMMENDATION
+    ):
         st.success(
             f"Recommended scenario: {recommendation.scenario_id} "
             f"({recommendation.action})"
@@ -415,15 +577,51 @@ def _render_results(
                 + _money(recommendation.cost.total_cost, currency)
             )
         st.write(recommendation.explanation)
+    elif (
+        result.recommendation_status
+        is RecommendationStatus.NO_FEASIBLE_SCENARIO
+    ):
+        st.warning("No feasible supplier scenario satisfies the supplied constraints.")
+        st.write(recommendation.explanation)
+    elif (
+        result.recommendation_status
+        is RecommendationStatus.NO_COMPLETE_COST_SCENARIO
+    ):
+        st.warning(
+            "Feasible scenarios exist, but none has a complete cost estimate; "
+            "no cost-only recommendation was made."
+        )
+        st.write(recommendation.explanation)
+    elif (
+        result.recommendation_status
+        is RecommendationStatus.NO_ELIGIBLE_SCENARIO
+    ):
+        st.warning(
+            "No scenario is confirmed feasible with a complete cost estimate; "
+            "no cost-only recommendation was made."
+        )
+        st.write(recommendation.explanation)
+    elif result.recommendation_status is RecommendationStatus.UNSPECIFIED:
+        st.warning(
+            "Recommendation status is unspecified/unconfirmed; no scenario "
+            "is presented as recommended."
+        )
+        st.write(recommendation.explanation)
 
     st.caption("Selection rule: " + recommendation.selection_rule)
     st.subheader("Scenario comparison")
+    recommended_scenario_id = (
+        recommendation.scenario_id
+        if result.recommendation_status
+        is RecommendationStatus.COST_ONLY_RECOMMENDATION
+        else None
+    )
     for scenario in result.scenarios:
         _render_scenario(
             scenario,
             currency,
             quantity_unit,
-            recommendation.scenario_id,
+            recommended_scenario_id,
         )
 
     with st.expander("Assumptions and limitations"):
@@ -444,7 +642,12 @@ def main() -> None:
         layout="wide",
     )
     st.title("Adaptive Supply-Chain Decision Engine")
-    st.warning("Cost-only recommendation — disruption risk is not assessed.")
+    st.warning(
+        "Cost-only is the default recommendation policy. Risk-aware mode "
+        "currently withholds a winner because comparable scenario risk inputs "
+        "are unavailable. The incident index is a heuristic, not a disruption "
+        "probability."
+    )
     st.info(
         "No operational data is preloaded. Values entered below are "
         "user-provided/demo inputs and are not verified project or supplier data."
@@ -452,15 +655,21 @@ def main() -> None:
 
     st.subheader("Incident Analysis (NLP)")
     st.caption(
-        "Classifies the incident text into an event category only. "
-        "This result does not represent disruption probability or risk and "
-        "does not affect supplier recommendations."
+        "Classifies the incident text into an event category, then optionally "
+        "shows a configurable heuristic index using the selected severity. "
+        "The index is not validated or probabilistic and does not affect "
+        "supplier recommendations."
     )
     with st.form("incident_analysis_form"):
         incident_description = st.text_area(
             "Incident description",
             key="incident_description",
             placeholder="Describe the reported supply-chain incident",
+        )
+        incident_severity = st.selectbox(
+            "Incident severity",
+            options=("Not provided", "Minor", "Moderate", "Severe", "Extreme"),
+            key="incident_severity",
         )
         classify_submitted = st.form_submit_button(
             "Classify incident",
@@ -469,10 +678,20 @@ def main() -> None:
 
     if classify_submitted:
         st.session_state["incident_analysis_result"] = None
+        st.session_state["incident_risk_assessment"] = None
         st.session_state["incident_analysis_error"] = None
+        st.session_state["confirm_incident_order_association"] = False
         try:
-            st.session_state["incident_analysis_result"] = classify_incident(
+            event_category = classify_incident(
                 incident_description
+            )
+            st.session_state["incident_analysis_result"] = event_category
+            severity_value = (
+                None if incident_severity == "Not provided" else incident_severity
+            )
+            st.session_state["incident_risk_assessment"] = score_incident(
+                event_category,
+                severity_value,
             )
         except (FileNotFoundError, RuntimeError, ValueError) as exc:
             st.session_state["incident_analysis_error"] = str(exc)
@@ -483,6 +702,22 @@ def main() -> None:
         st.error(incident_error)
     elif incident_result:
         st.success(f"Predicted event category: {incident_result}")
+        risk_assessment = st.session_state.get("incident_risk_assessment")
+        if isinstance(risk_assessment, RiskAssessment):
+            if risk_assessment.score is None:
+                st.info(
+                    f"Heuristic incident risk index: "
+                    f"{risk_assessment.level.value}"
+                )
+            else:
+                st.info(
+                    f"Heuristic incident risk index: {risk_assessment.score}/100 "
+                    f"- {risk_assessment.level.value}"
+                )
+            for note in risk_assessment.notes:
+                st.caption(note)
+
+    _render_late_delivery_prediction()
 
     with st.sidebar:
         st.header("Scenario setup")
@@ -494,18 +729,25 @@ def main() -> None:
             step=1,
         )
 
+    incident_risk_assessment = st.session_state.get("incident_risk_assessment")
     with st.form("decision_engine_form"):
         st.subheader("Order")
         order_col1, order_col2 = st.columns(2)
         with order_col1:
-            product_id = st.text_input("Product ID", placeholder="Enter product ID")
+            product_id = st.text_input(
+                "Product ID",
+                placeholder="Enter product ID",
+                key="decision_product_id",
+            )
             order_quantity = st.text_input(
                 "Order quantity",
                 placeholder="Enter a positive quantity",
+                key="decision_order_quantity",
             )
             quantity_unit = st.text_input(
                 "Quantity unit",
                 placeholder="For example, units or kg",
+                key="decision_quantity_unit",
             )
         with order_col2:
             currency = st.text_input(
@@ -516,6 +758,39 @@ def main() -> None:
             st.caption(
                 "Supplier capacities and allocations use the order quantity unit."
             )
+
+        st.subheader("Incident association (optional)")
+        if isinstance(incident_risk_assessment, RiskAssessment):
+            incident_association_confirmed = st.checkbox(
+                "I confirm this analyzed incident is associated with this order evaluation",
+                key="confirm_incident_order_association",
+                help=(
+                    "This is a user assertion for this evaluation only. "
+                    "The project data does not verify an incident-to-order link."
+                ),
+            )
+        else:
+            incident_association_confirmed = False
+            st.caption(
+                "No incident risk assessment is available. "
+                "The decision engine will treat incident risk as unassessed."
+            )
+
+        decision_policy = st.selectbox(
+            "Recommendation policy",
+            options=list(DecisionPolicy),
+            format_func=lambda policy: (
+                "Cost-only (default)"
+                if policy is DecisionPolicy.COST_ONLY
+                else "Risk-aware (currently unavailable)"
+            ),
+            key="decision_policy",
+            help=(
+                "Risk-aware mode withholds a winner until comparable "
+                "supplier-specific risk inputs and an approved conversion "
+                "policy exist."
+            ),
+        )
 
         st.subheader("Current supplier")
         current_supplier_data = _supplier_fields(
@@ -546,9 +821,13 @@ def main() -> None:
             placeholder="Enter limit",
             disabled=not max_lead_time_enabled,
         )
-        max_budget_enabled = st.checkbox("Apply maximum budget")
+        max_budget_enabled = st.checkbox(
+            "Apply maximum budget",
+            key="max_budget_enabled",
+        )
         max_budget = st.text_input(
             "Maximum budget (in selected currency)",
+            key="max_budget",
             placeholder="Enter limit",
             disabled=not max_budget_enabled,
         )
@@ -621,6 +900,12 @@ def main() -> None:
                 approved_supplier_ids_text=approved_supplier_ids_text,
                 max_suppliers_enabled=max_suppliers_enabled,
                 max_suppliers=int(max_suppliers),
+                incident_context=_build_incident_risk_context(
+                    incident_risk_assessment
+                    if isinstance(incident_risk_assessment, RiskAssessment)
+                    else None,
+                    incident_association_confirmed,
+                ),
             )
             supplier_ids = [
                 evaluation.current_supplier.supplier_id,
@@ -637,6 +922,7 @@ def main() -> None:
             result = evaluate_order(
                 evaluation,
                 split_allocations=explicit_splits,
+                policy=decision_policy,
             )
         except (ValueError, InvalidOperation) as exc:
             st.error(f"Could not evaluate the entered data: {exc}")

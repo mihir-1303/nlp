@@ -6,12 +6,19 @@ import unittest
 from person3_decision.cost_model import calculate_cost
 from person3_decision.decision_engine import (
     Constraints,
+    DecisionPolicy,
     EvaluationInput,
     FeasibilityStatus,
+    IncidentAssociationStatus,
+    IncidentRiskContext,
     OrderInput,
+    RecommendationStatus,
+    RiskComparisonStatus,
     SupplierOption,
     evaluate_order,
 )
+from person3_decision.disruption_prediction import DisruptionPredictionStatus
+from person3_decision.risk_scoring import RiskLevel, score_incident
 
 
 def synthetic_evaluation(
@@ -213,6 +220,11 @@ class DecisionEngineTests(unittest.TestCase):
     def test_lowest_cost_feasible_scenario_is_selected(self):
         result = evaluate_order(synthetic_evaluation())
         self.assertEqual(
+            result.recommendation_status,
+            RecommendationStatus.COST_ONLY_RECOMMENDATION,
+        )
+        self.assertTrue(result.has_feasible_scenario)
+        self.assertEqual(
             result.recommendation.scenario_id,
             "switch_to_SYNTHETIC-ALT",
         )
@@ -220,6 +232,11 @@ class DecisionEngineTests(unittest.TestCase):
             result.recommendation.cost.total_cost,
             Decimal("83"),
         )
+        self.assertEqual(
+            result.disruption_prediction.status,
+            DisruptionPredictionStatus.UNAVAILABLE,
+        )
+        self.assertIsNone(result.disruption_prediction.probability)
 
     def test_exact_cost_tie_uses_lexicographically_smallest_scenario_id(self):
         evaluation = synthetic_evaluation(
@@ -297,11 +314,228 @@ class DecisionEngineTests(unittest.TestCase):
         )
         self.assertIsNone(result.recommendation.scenario_id)
         self.assertIsNone(result.recommendation.cost)
+        self.assertEqual(
+            result.recommendation_status,
+            RecommendationStatus.NO_ELIGIBLE_SCENARIO,
+        )
+
+    def test_no_feasible_scenario_has_distinct_status(self):
+        result = evaluate_order(
+            synthetic_evaluation(constraints=Constraints(max_budget=50))
+        )
+
+        self.assertFalse(result.has_feasible_scenario)
+        self.assertEqual(
+            result.recommendation_status,
+            RecommendationStatus.NO_FEASIBLE_SCENARIO,
+        )
+        self.assertIsNone(result.recommendation.scenario_id)
+
+    def test_feasible_scenarios_without_complete_cost_have_distinct_status(self):
+        result = evaluate_order(
+            synthetic_evaluation(
+                current_cost=None,
+                alternative_cost=None,
+                constraints=Constraints(),
+            )
+        )
+
+        self.assertTrue(result.has_feasible_scenario)
+        self.assertEqual(
+            result.recommendation_status,
+            RecommendationStatus.NO_COMPLETE_COST_SCENARIO,
+        )
+        self.assertIsNone(result.recommendation.scenario_id)
 
     def test_residual_risk_is_not_assessed(self):
         result = evaluate_order(synthetic_evaluation())
         self.assertEqual(result.residual_risk, "not_assessed")
         self.assertEqual(result.recommendation_policy, "cost_only")
+        self.assertEqual(
+            result.risk_comparison_status,
+            RiskComparisonStatus.NOT_REQUESTED,
+        )
+        self.assertIsNone(result.incident_context)
+
+    def test_incident_context_is_preserved_without_changing_cost_only_ranking(self):
+        baseline = evaluate_order(synthetic_evaluation())
+        assessment = score_incident("Weather", None)
+        context = IncidentRiskContext(
+            association_status=IncidentAssociationStatus.UNLINKED,
+            risk_assessment=assessment,
+        )
+        evaluation = synthetic_evaluation()
+        with_context = EvaluationInput(
+            order=evaluation.order,
+            current_supplier=evaluation.current_supplier,
+            alternative_suppliers=evaluation.alternative_suppliers,
+            constraints=evaluation.constraints,
+            incident_context=context,
+        )
+
+        result = evaluate_order(with_context)
+
+        self.assertIs(result.incident_context, context)
+        self.assertEqual(
+            result.incident_context.association_status,
+            IncidentAssociationStatus.UNLINKED,
+        )
+        self.assertIsNone(result.incident_context.risk_assessment.score)
+        self.assertEqual(
+            result.incident_context.risk_assessment.level,
+            RiskLevel.UNASSESSED,
+        )
+        self.assertEqual(result.recommendation_policy, "cost_only")
+        self.assertEqual(result.residual_risk, "not_assessed")
+        self.assertEqual(
+            result.recommendation.scenario_id,
+            baseline.recommendation.scenario_id,
+        )
+
+    def test_risk_aware_without_supplier_risk_inputs_withholds_recommendation(self):
+        result = evaluate_order(
+            synthetic_evaluation(),
+            policy=DecisionPolicy.RISK_AWARE,
+        )
+
+        self.assertEqual(result.recommendation_policy, "risk_aware")
+        self.assertEqual(
+            result.risk_comparison_status,
+            RiskComparisonStatus.NOT_COMPARABLE,
+        )
+        self.assertEqual(
+            result.recommendation_status,
+            RecommendationStatus.RISK_COMPARISON_UNAVAILABLE,
+        )
+        self.assertTrue(result.has_feasible_scenario)
+        self.assertIsNone(result.recommendation.scenario_id)
+        self.assertTrue(
+            any(
+                "Supplier- and scenario-specific risk inputs"
+                in reason
+                for reason in result.risk_comparison_reasons
+            )
+        )
+        self.assertTrue(
+            all(scenario.feasibility is FeasibilityStatus.FEASIBLE for scenario in result.scenarios)
+        )
+        self.assertEqual(
+            result.scenarios[0].cost.purchase_cost,
+            Decimal("100"),
+        )
+        self.assertEqual(
+            result.scenarios[0].cost.switching_cost,
+            Decimal("0"),
+        )
+        self.assertIn("not comparable", result.recommendation.explanation)
+
+    def test_risk_aware_unavailable_remains_distinct_when_no_scenario_is_feasible(self):
+        result = evaluate_order(
+            synthetic_evaluation(constraints=Constraints(max_budget=50)),
+            policy=DecisionPolicy.RISK_AWARE,
+        )
+
+        self.assertEqual(
+            result.recommendation_status,
+            RecommendationStatus.RISK_COMPARISON_UNAVAILABLE,
+        )
+        self.assertFalse(result.has_feasible_scenario)
+        self.assertIsNone(result.recommendation.scenario_id)
+        self.assertEqual(
+            result.risk_comparison_status,
+            RiskComparisonStatus.NOT_COMPARABLE,
+        )
+
+    def test_unlinked_assessment_cannot_be_used_as_risk_aware_input(self):
+        context = IncidentRiskContext(
+            association_status=IncidentAssociationStatus.UNLINKED,
+            risk_assessment=score_incident("Weather", "Severe"),
+        )
+        evaluation = synthetic_evaluation()
+        evaluation = EvaluationInput(
+            order=evaluation.order,
+            current_supplier=evaluation.current_supplier,
+            alternative_suppliers=evaluation.alternative_suppliers,
+            incident_context=context,
+        )
+
+        result = evaluate_order(evaluation, policy="risk_aware")
+
+        self.assertIsNone(result.recommendation.scenario_id)
+        self.assertIn(
+            "No user-confirmed incident association is available for this evaluation.",
+            result.risk_comparison_reasons,
+        )
+        self.assertNotIn(
+            "A complete incident risk assessment is not available; "
+            "unassessed risk is not treated as zero.",
+            result.risk_comparison_reasons,
+        )
+
+    def test_unassessed_context_is_not_treated_as_zero_risk(self):
+        context = IncidentRiskContext(
+            association_status=IncidentAssociationStatus.USER_CONFIRMED,
+            risk_assessment=score_incident("Weather", None),
+        )
+        evaluation = synthetic_evaluation()
+        evaluation = EvaluationInput(
+            order=evaluation.order,
+            current_supplier=evaluation.current_supplier,
+            alternative_suppliers=evaluation.alternative_suppliers,
+            incident_context=context,
+        )
+
+        result = evaluate_order(evaluation, policy=DecisionPolicy.RISK_AWARE)
+
+        self.assertIsNone(result.recommendation.scenario_id)
+        self.assertEqual(
+            result.risk_comparison_status,
+            RiskComparisonStatus.NOT_COMPARABLE,
+        )
+        self.assertIn(
+            "A complete incident risk assessment is not available; "
+            "unassessed risk is not treated as zero.",
+            result.risk_comparison_reasons,
+        )
+
+    def test_confirmed_assessment_still_blocked_without_approved_policy(self):
+        context = IncidentRiskContext(
+            association_status=IncidentAssociationStatus.USER_CONFIRMED,
+            risk_assessment=score_incident("Weather", "Severe"),
+        )
+        evaluation = synthetic_evaluation()
+        evaluation = EvaluationInput(
+            order=evaluation.order,
+            current_supplier=evaluation.current_supplier,
+            alternative_suppliers=evaluation.alternative_suppliers,
+            incident_context=context,
+        )
+
+        result = evaluate_order(evaluation, policy=DecisionPolicy.RISK_AWARE)
+
+        self.assertIsNone(result.recommendation.scenario_id)
+        self.assertIn(
+            "Supplier- and scenario-specific risk inputs are not available.",
+            result.risk_comparison_reasons,
+        )
+        self.assertIn(
+            "An approved risk-to-cost conversion policy has not been defined.",
+            result.risk_comparison_reasons,
+        )
+        self.assertEqual(result.recommendation_policy, "risk_aware")
+
+    def test_user_confirmed_association_is_evaluation_scoped_context(self):
+        assessment = score_incident("Weather", "Severe")
+        context = IncidentRiskContext(
+            association_status=IncidentAssociationStatus.USER_CONFIRMED,
+            risk_assessment=assessment,
+        )
+
+        self.assertEqual(
+            context.association_status.value,
+            "user_confirmed_for_evaluation",
+        )
+        self.assertEqual(context.risk_assessment.score, 70)
 
     def test_nlp_confidence_is_not_an_engine_input_or_risk_probability(self):
         result = evaluate_order(synthetic_evaluation())

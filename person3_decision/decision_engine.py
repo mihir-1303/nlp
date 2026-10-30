@@ -1,7 +1,7 @@
-"""Generate and rank supply scenarios using explicitly supplied order data.
+"""Evaluate supply scenarios using explicitly supplied order data.
 
-The recommendation policy is cost-only. It does not estimate disruption
-probability or residual risk and does not require the Person 2 model.
+Cost-only ranking is the default. Risk-aware selection is unavailable until
+supplier/scenario risk inputs and an approved conversion policy exist.
 """
 
 from __future__ import annotations
@@ -12,6 +12,11 @@ from enum import Enum
 from typing import Mapping, Sequence
 
 from .cost_model import CostEstimate, calculate_cost
+from .disruption_prediction import (
+    DISRUPTION_PREDICTION_UNAVAILABLE,
+    DisruptionPrediction,
+)
+from .risk_scoring import RiskAssessment
 
 Number = Decimal | int | float | str
 
@@ -143,6 +148,36 @@ class Constraints:
                 raise ValueError("max_suppliers_per_order must be a positive integer.")
 
 
+class IncidentAssociationStatus(str, Enum):
+    """Whether an incident is explicitly associated with this evaluation."""
+
+    UNLINKED = "unlinked"
+    USER_CONFIRMED = "user_confirmed_for_evaluation"
+
+
+@dataclass(frozen=True)
+class IncidentRiskContext:
+    """Optional incident context, with user confirmation distinct from data linkage.
+
+    ``risk_assessment`` may be ``None`` or unassessed; neither means low risk.
+    ``USER_CONFIRMED`` records a user's association to this evaluation only. It
+    is not a verified incident/order relationship from project data.
+    """
+
+    association_status: IncidentAssociationStatus
+    risk_assessment: RiskAssessment | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.association_status, IncidentAssociationStatus):
+            raise ValueError(
+                "association_status must be an IncidentAssociationStatus."
+            )
+        if self.risk_assessment is not None and not isinstance(
+            self.risk_assessment, RiskAssessment
+        ):
+            raise ValueError("risk_assessment must be a RiskAssessment or None.")
+
+
 @dataclass(frozen=True)
 class EvaluationInput:
     """Complete input for evaluating one order and its supplier options."""
@@ -151,6 +186,7 @@ class EvaluationInput:
     current_supplier: SupplierOption
     alternative_suppliers: tuple[SupplierOption, ...] = ()
     constraints: Constraints = field(default_factory=Constraints)
+    incident_context: IncidentRiskContext | None = None
 
     def __post_init__(self) -> None:
         alternatives = tuple(self.alternative_suppliers)
@@ -160,6 +196,10 @@ class EvaluationInput:
         ]
         if len(supplier_ids) != len(set(supplier_ids)):
             raise ValueError("Supplier IDs must be unique within an evaluation.")
+        if self.incident_context is not None and not isinstance(
+            self.incident_context, IncidentRiskContext
+        ):
+            raise ValueError("incident_context must be an IncidentRiskContext or None.")
 
 
 class FeasibilityStatus(str, Enum):
@@ -168,6 +208,31 @@ class FeasibilityStatus(str, Enum):
     FEASIBLE = "feasible"
     INFEASIBLE = "infeasible"
     UNKNOWN = "unknown"
+
+
+class DecisionPolicy(str, Enum):
+    """Requested scenario-selection policy."""
+
+    COST_ONLY = "cost_only"
+    RISK_AWARE = "risk_aware"
+
+
+class RiskComparisonStatus(str, Enum):
+    """Whether candidate scenario risk can be compared under a policy."""
+
+    NOT_REQUESTED = "not_requested"
+    NOT_COMPARABLE = "not_comparable"
+
+
+class RecommendationStatus(str, Enum):
+    """Why a decision result does or does not contain a selected scenario."""
+
+    UNSPECIFIED = "unspecified"
+    COST_ONLY_RECOMMENDATION = "cost_only_recommendation"
+    NO_FEASIBLE_SCENARIO = "no_feasible_scenario"
+    NO_COMPLETE_COST_SCENARIO = "no_complete_cost_scenario"
+    NO_ELIGIBLE_SCENARIO = "no_eligible_scenario"
+    RISK_COMPARISON_UNAVAILABLE = "risk_comparison_unavailable"
 
 
 @dataclass(frozen=True)
@@ -220,14 +285,33 @@ class DecisionResult:
         "Only purchase and explicitly supplied switching costs are included.",
     )
     limitations: tuple[str, ...] = (
-        "This policy is cost-only and is not risk-aware.",
+        "Cost-only is the default; risk-aware comparison is unavailable.",
         "Transportation, inventory holding, stockout, and disruption-loss "
         "costs are not included.",
         "Person 1 event-classifier confidence is not used as disruption "
         "probability.",
         "Person 2 predictions are not required or consumed.",
         "Feasibility covers only the supplied constraints and supplier data.",
+        "Incident context is informational and does not affect scenario ranking.",
     )
+    incident_context: IncidentRiskContext | None = None
+    risk_comparison_status: RiskComparisonStatus = (
+        RiskComparisonStatus.NOT_REQUESTED
+    )
+    risk_comparison_reasons: tuple[str, ...] = ()
+    recommendation_status: RecommendationStatus = RecommendationStatus.UNSPECIFIED
+    disruption_prediction: DisruptionPrediction = (
+        DISRUPTION_PREDICTION_UNAVAILABLE
+    )
+
+    @property
+    def has_feasible_scenario(self) -> bool:
+        """Whether any scenario is explicitly feasible under supplied data."""
+
+        return any(
+            scenario.feasibility is FeasibilityStatus.FEASIBLE
+            for scenario in self.scenarios
+        )
 
 
 def _scenario_cost(
@@ -369,13 +453,24 @@ def _validate_explicit_allocations(
 def evaluate_order(
     evaluation: EvaluationInput,
     split_allocations: Sequence[Mapping[str, Number]] = (),
+    policy: DecisionPolicy | str = DecisionPolicy.COST_ONLY,
 ) -> DecisionResult:
-    """Evaluate current-supplier, switch, and explicitly supplied split options.
+    """Evaluate scenarios using cost-only ranking or report risk as incomparable.
 
     Split allocations are mappings from supplier ID to allocated quantity.
     Malformed split allocations raise ``ValueError``. Capacity and constraint
-    violations instead remain visible as scenario results.
+    violations instead remain visible as scenario results. The risk-aware
+    policy is deliberately blocked until supplier/scenario risk inputs and an
+    approved risk-to-cost conversion contract exist; it never falls back to
+    cost-only ranking or treats unknown risk as zero.
     """
+
+    try:
+        selected_policy = DecisionPolicy(policy)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "policy must be 'cost_only' or 'risk_aware'."
+        ) from exc
 
     suppliers = {
         evaluation.current_supplier.supplier_id: evaluation.current_supplier,
@@ -431,7 +526,53 @@ def evaluate_order(
         "cost estimates; break exact cost ties by lexicographically smallest "
         "scenario_id."
     )
-    if eligible:
+    risk_comparison_status = RiskComparisonStatus.NOT_REQUESTED
+    risk_comparison_reasons: tuple[str, ...] = ()
+    recommendation_status: RecommendationStatus
+    if selected_policy is DecisionPolicy.RISK_AWARE:
+        selection_rule = (
+            "Risk-aware comparison is unavailable. No risk-adjusted winner "
+            "is selected until the required risk inputs and approved conversion "
+            "policy are implemented."
+        )
+        risk_comparison_status = RiskComparisonStatus.NOT_COMPARABLE
+        reasons = [
+            "Supplier- and scenario-specific risk inputs are not available.",
+            "An approved risk-to-cost conversion policy has not been defined.",
+        ]
+        context = evaluation.incident_context
+        if (
+            context is None
+            or context.association_status is IncidentAssociationStatus.UNLINKED
+        ):
+            reasons.append(
+                "No user-confirmed incident association is available for this evaluation."
+            )
+        if (
+            context is None
+            or context.risk_assessment is None
+            or context.risk_assessment.score is None
+        ):
+            reasons.append(
+                "A complete incident risk assessment is not available; "
+                "unassessed risk is not treated as zero."
+            )
+        risk_comparison_reasons = tuple(reasons)
+        recommendation_status = RecommendationStatus.RISK_COMPARISON_UNAVAILABLE
+        recommendation = Recommendation(
+            scenario_id=None,
+            action=None,
+            allocations=(),
+            cost=None,
+            selection_rule=selection_rule,
+            explanation=(
+                "No risk-aware recommendation was made because scenario risk "
+                "is not comparable with the available inputs. The cost and "
+                "feasibility results remain visible, but are not presented as "
+                "a risk-aware ranking."
+            ),
+        )
+    elif eligible:
         selected = min(
             eligible,
             key=lambda scenario: (
@@ -452,7 +593,22 @@ def evaluate_order(
                 "disruption risk was not assessed."
             ),
         )
+        recommendation_status = RecommendationStatus.COST_ONLY_RECOMMENDATION
     else:
+        if scenarios and all(
+            scenario.feasibility is FeasibilityStatus.INFEASIBLE
+            for scenario in scenarios
+        ):
+            recommendation_status = RecommendationStatus.NO_FEASIBLE_SCENARIO
+        elif any(
+            scenario.feasibility is FeasibilityStatus.FEASIBLE
+            for scenario in scenarios
+        ):
+            recommendation_status = (
+                RecommendationStatus.NO_COMPLETE_COST_SCENARIO
+            )
+        else:
+            recommendation_status = RecommendationStatus.NO_ELIGIBLE_SCENARIO
         recommendation = Recommendation(
             scenario_id=None,
             action=None,
@@ -473,4 +629,10 @@ def evaluate_order(
         currency=evaluation.order.currency,
         scenarios=scenarios,
         recommendation=recommendation,
+        incident_context=evaluation.incident_context,
+        recommendation_policy=selected_policy.value,
+        risk_comparison_status=risk_comparison_status,
+        risk_comparison_reasons=risk_comparison_reasons,
+        recommendation_status=recommendation_status,
+        disruption_prediction=DISRUPTION_PREDICTION_UNAVAILABLE,
     )

@@ -12,8 +12,12 @@ from person3_decision.decision_engine import (
     Constraints,
     EvaluationInput,
     OrderInput,
+    RecommendationStatus,
     SupplierOption,
     evaluate_order,
+)
+from person3_decision.disruption_prediction import (
+    DISRUPTION_PREDICTION_UNAVAILABLE,
 )
 
 
@@ -30,6 +34,10 @@ def main() -> None:
 
     print("SYNTHETIC DEMONSTRATION - values below are not project data.")
     print("Recommendation policy: COST-ONLY. Residual risk: NOT ASSESSED.\n")
+    print(
+        "Operational disruption prediction: UNAVAILABLE. "
+        f"{DISRUPTION_PREDICTION_UNAVAILABLE.reason}"
+    )
 
     evaluation = EvaluationInput(
         order=OrderInput(
@@ -125,9 +133,7 @@ def main() -> None:
 
     recommendation = result.recommendation
     print("\nRECOMMENDATION")
-    if recommendation.scenario_id is None:
-        print("No recommendation available.")
-    else:
+    if result.recommendation_status is RecommendationStatus.COST_ONLY_RECOMMENDATION:
         print(f"Scenario: {recommendation.scenario_id}")
         print(f"Action: {recommendation.action}")
         print(
@@ -143,6 +149,28 @@ def main() -> None:
                 "Estimated total cost: "
                 f"{_format_money(recommendation.cost.total_cost, result.currency)}"
             )
+    elif (
+        result.recommendation_status
+        is RecommendationStatus.NO_FEASIBLE_SCENARIO
+    ):
+        print("No feasible scenario satisfies the supplied constraints.")
+    elif (
+        result.recommendation_status
+        is RecommendationStatus.NO_COMPLETE_COST_SCENARIO
+    ):
+        print("Feasible scenarios exist, but no complete cost estimate is available.")
+    elif (
+        result.recommendation_status
+        is RecommendationStatus.RISK_COMPARISON_UNAVAILABLE
+    ):
+        print("Risk-aware comparison unavailable; no winner was selected.")
+    elif result.recommendation_status is RecommendationStatus.UNSPECIFIED:
+        print(
+            "Recommendation status unspecified/unconfirmed; "
+            "no recommendation is confirmed."
+        )
+    else:
+        print("No eligible scenario is confirmed feasible with a complete cost.")
     print(f"Selection rule: {recommendation.selection_rule}")
     print(f"Explanation: {recommendation.explanation}")
     print(f"Policy: {result.recommendation_policy}; risk: {result.residual_risk}.")

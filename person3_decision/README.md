@@ -8,10 +8,12 @@ supplied by the caller. It evaluates continuing with the current supplier,
 switching the full order to each alternative, and any split-order allocations
 explicitly supplied to `evaluate_order`.
 
-The recommendation policy is **cost-only**, not risk-aware. The engine does
-not predict disruption probability, estimate residual risk, require Person 2's
-model, or consume Person 1's NLP classifier confidence. Residual risk is always
-reported as `not_assessed`.
+The recommendation policy defaults to **cost-only**. An optional `risk_aware`
+policy can be requested, but it currently returns **not comparable** and
+withholds a winner; the project does not contain the supplier/scenario risk
+inputs or approved risk-to-cost conversion needed for a defensible comparison.
+The supplier decision policies do not consume late-delivery probability,
+incident classification, or Person 1's NLP classifier confidence.
 
 ## Incident analysis (NLP)
 
@@ -21,14 +23,173 @@ pipeline at
 `person1_nlp/models/supply_chain_event_pipeline.joblib`. The path is resolved
 relative to `person3_decision/app.py`, and Streamlit caches the loaded model
 resource. The pipeline returns an event category such as `Weather`; it does
-not return disruption probability. The category is displayed separately and
-does not alter supplier inputs, scenario costs, or recommendations.
+not return disruption probability. The category and its derived heuristic
+index do not affect supplier scenario costs or recommendation ranking.
 
 For example, the synthetic/example text
 `Heavy rainfall caused flooding and delayed transportation.` is expected to
 be classified as `Weather` by the saved artifact. This label describes the
 classifier output only; it is not a risk score or a claim about operational
 impact.
+
+## Late-delivery prediction
+
+The dashboard also provides a standalone **Late-delivery prediction
+(order-time inputs)** form. It reuses the saved
+`person1_nlp/supply-chain-prediction/late_delivery_model.joblib` pipeline;
+the artifact path is resolved from the source file, independent of the current
+working directory. The raw input columns are passed directly to the saved
+pipeline, which owns its fitted preprocessing:
+
+- Numeric: scheduled shipment days, item quantity, item product price, item
+  discount, item discount rate, latitude, and longitude.
+- Categorical: payment type, shipping mode, market, order region, category
+  name, department name, and customer segment.
+
+All required inputs are validated before inference. Missing/invalid values,
+artifact-loading errors, and prediction failures are shown in the dashboard
+instead of terminating it. The displayed probability is for the dataset's
+`Late_delivery_risk` target (which matches the `Delivery Status == "Late
+delivery"` label); it is **not** a general supply-chain disruption probability
+or a prediction about an incident or supplier.
+
+The warning threshold defaults to **0.4** and can be changed in the form. It
+is a selected prototype operating threshold, not a calibrated probability
+cutoff or a proven business optimum. The late-delivery output remains separate
+from NLP incident classification, the heuristic incident-risk index, supplier
+risk estimates, and decision-engine inputs. It does not change supplier
+rankings, costs, allocations, or the cost-only recommendation policy.
+
+## Heuristic incident risk index
+
+After classifying an incident, the dashboard can calculate a separate
+heuristic index from the predicted event category and the user-selected
+severity. The pure scoring interface is:
+
+```python
+from person3_decision.risk_scoring import score_incident
+
+assessment = score_incident("Weather", "Severe")
+print(assessment.score, assessment.level.value)
+```
+
+`RiskScoringConfig` in `person3_decision/risk_scoring.py` provides configurable
+category points, severity points, a maximum score, and inclusive level
+boundaries. The current defaults are provisional illustrative choices, not
+derived from training outcomes or approved by an operational risk owner. For
+complete, recognized inputs, the index adds category and severity points and
+caps the result at 100. Missing or unrecognized inputs return `score=None` and
+the `Unassessed` level instead of being treated as zero.
+
+This is a heuristic index, **not a validated prediction or calibrated
+probability of a future disruption**. The project data has event categories
+and severity labels but no linked shipment/supplier outcome target. The index
+is informational context only and does not alter the cost-only supplier
+recommendation. Domain-owner approval of the mappings and thresholds,
+followed by validation against outcome-linked records, is required before
+operational use.
+
+## Operational disruption prediction status
+
+Operational disruption prediction is currently **unavailable**. The inspected
+GMRID train/test schemas provide incident `id`, text, `Severity`, `Region`,
+`Datetime`, `Category`, and `Summarized_label`. The classifier training scripts
+use `Summarized_label` as the target, and the test-prediction export compares
+`predicted_label` against that event-class label. These are event categories,
+not observed future disruptions of particular orders, shipments, or suppliers.
+The NLP feature exports include `predicted_event_type` and
+`event_prediction_confidence`; that confidence applies only to the event-class
+prediction and is not disruption probability.
+
+Each `DecisionResult` carries a typed `disruption_prediction` with
+`status="unavailable"`, `probability=None`, a reason, and the data prerequisites
+to change that status. The dashboard and synthetic demo display this
+availability separately from NLP classification and the heuristic index. It
+does not affect cost-only ranking or enable risk-aware comparison.
+
+Enabling supervised operational prediction requires, at minimum:
+
+1. Stable order, shipment, and supplier IDs and an auditable relationship
+   between incident records and the affected operational records.
+2. A defined prediction-time point and a domain-approved future horizon.
+3. Outcome labels for that unit and horizon, including non-disrupted examples,
+   explicit outcome definitions, and event timestamps. Labels must be based on
+   observed operational outcomes rather than inferred from incident category
+   or severity.
+4. For impact prediction, measured delay durations or financial losses with
+   documented units, currency, and measurement windows.
+
+Once available, establish a time-ordered, leakage-safe train/validation/test
+split and evaluate against the approved target with suitable classification
+metrics (including class-sensitive metrics for a binary disruption target) or
+regression metrics for measured impact. No such target or evaluation is
+implemented now.
+
+## Incident-to-evaluation context contract
+
+`IncidentRiskContext` is an optional typed field on `EvaluationInput` and is
+carried unchanged into `DecisionResult`. It contains:
+
+- `association_status`: `IncidentAssociationStatus.UNLINKED` or
+  `IncidentAssociationStatus.USER_CONFIRMED`.
+- `risk_assessment`: a `RiskAssessment` or `None`. A `RiskAssessment` may itself
+  be unassessed (`score=None`, level `Unassessed`).
+
+The dashboard presents an unchecked-by-default confirmation for the current
+evaluation. Checking it means only that the user asserts the analyzed incident
+is relevant to this evaluation; the repository has no verified incident/order
+join key, and the current order form has no unique order ID. Without
+confirmation, an available assessment is carried as `UNLINKED`. With no
+assessment, the context is absent. Missing or unassessed risk is displayed
+explicitly and must not be interpreted as low risk.
+
+This contract is for traceability, not supplier-specific exposure. The
+assessment is not copied to each supplier or scenario.
+
+## Decision policies and result status
+
+`evaluate_order(evaluation, split_allocations=(), policy=...)` accepts
+`DecisionPolicy.COST_ONLY` (the default) or `DecisionPolicy.RISK_AWARE`.
+
+- **Cost-only:** unchanged behavior. Among feasible scenarios with complete
+  costs, select the lowest total of purchase cost plus applicable switching
+  cost; exact ties use `scenario_id`. Infeasible/unknown feasibility and
+  incomplete costs remain excluded as before.
+- **Risk-aware:** currently blocked. It returns
+  `RiskComparisonStatus.NOT_COMPARABLE`, an explicit list of missing
+  prerequisites, and no recommendation. It does not silently fall back to a
+  cost-only winner. Scenario feasibility and `CostEstimate` values remain
+  available separately for inspection.
+- `recommendation_status` makes the outcome explicit:
+  `cost_only_recommendation`, `no_feasible_scenario`,
+  `no_complete_cost_scenario`, `no_eligible_scenario`, or
+  `risk_comparison_unavailable`. The last status means the requested policy
+  could not compare risk and never exposes a cost-only winner as a risk-aware
+  result. `has_feasible_scenario` reports whether any scenario is explicitly
+  marked feasible, independently of recommendation status.
+- `unspecified` is the compatibility default for manually constructed
+  `DecisionResult` objects; `evaluate_order` always assigns an outcome status.
+  Downstream consumers must treat it as unconfirmed regardless of whether a
+  recommendation scenario ID is populated.
+- `no_feasible_scenario` is used only when every evaluated scenario is
+  explicitly infeasible. `no_eligible_scenario` covers cases where none is
+  explicitly infeasible but no scenario qualifies for recommendation, such as
+  unknown feasibility. `no_complete_cost_scenario` means at least one scenario
+  is feasible, but none has a complete cost estimate.
+
+The current engine has no supplier/scenario risk-input contract or
+risk-contribution values. Therefore risk contribution is **unavailable**, not
+zero. Unlinked incidents, missing assessments, and `Unassessed` scores cannot
+be treated as low risk. Even a user-confirmed incident with a numeric
+heuristic score is insufficient for risk-aware ranking.
+
+No risk-adjusted objective formula or currency conversion has been selected
+or implemented. A future policy must not combine money and heuristic points
+until domain owners approve (1) supplier and allocation-specific exposure
+inputs, (2) a risk-to-cost conversion or another comparable decision rule,
+and (3) behavior for missing scenario values. Those decisions and the required
+data are blockers; the provisional category/severity weights in
+`risk_scoring.py` do not define them.
 
 ## Requirements and execution
 
@@ -37,6 +198,7 @@ impact.
 - The dashboard requires Streamlit, joblib, and the scikit-learn version
   compatible with the saved pipeline; these are available in the selected
   workspace environment.
+- Risk scoring and its unit tests use only the Python standard library.
 
 From the repository root, run the standard-library test suite with:
 
@@ -144,13 +306,25 @@ estimate incomplete and prevents it from being recommended.
   total cost, a `complete` flag, and unknown component names.
 - `recommendation`: selected scenario ID/action/allocations/cost, or no
   selection (`None`), together with the selection rule and explanation.
-- `recommendation_policy`, always `cost_only` in this version.
+- `recommendation_policy`: `cost_only` by default, or `risk_aware` when
+  explicitly requested.
 - `residual_risk`, always `not_assessed`.
+- `risk_comparison_status`: `not_requested` for cost-only, or
+  `not_comparable` for the currently blocked risk-aware request.
+- `risk_comparison_reasons`: explicit prerequisites that prevent risk-aware
+  comparison. No risk contribution is fabricated for any scenario.
+- `recommendation_status`: the explicit outcome state listed above.
+- `has_feasible_scenario`: whether any scenario is explicitly feasible.
+- `disruption_prediction`: typed operational prediction availability. It is
+  `unavailable` with `probability=None` until outcome-linked data and a
+  prediction contract are established.
 - Assumptions and limitations.
 
-Only scenarios that are feasible and have complete costs are ranked. The
-lowest total cost wins; exact cost ties are broken by lexicographically
-smallest scenario ID. No eligible scenario means no recommendation.
+Under `cost_only`, only scenarios that are feasible and have complete costs
+are ranked. The lowest total cost wins; exact cost ties are broken by
+lexicographically smallest scenario ID. No eligible scenario means no
+recommendation. Under `risk_aware`, no scenario is ranked until the missing
+supplier/scenario risk-input and approved conversion contracts are implemented.
 
 ## Synthetic example
 
@@ -197,9 +371,10 @@ print(result.recommendation.scenario_id)
 
 ## Limitations and future integration
 
-- The NLP model classifies incident text into event categories only. It does
-  not estimate disruption probability, severity, supplier impact, or residual
-  risk, and it does not change the cost-only supplier recommendation.
+- The NLP model classifies incident text into event categories only. The
+  separately displayed heuristic index uses category and user-provided
+  severity but is not validated, probabilistic, or evidence of actual
+  supplier impact. Neither changes the cost-only supplier recommendation.
 - The dashboard requires the saved model artifact at the documented relative
   path. Missing or unreadable artifacts and inference failures are displayed
   to the user; the model is not retrained by the dashboard.

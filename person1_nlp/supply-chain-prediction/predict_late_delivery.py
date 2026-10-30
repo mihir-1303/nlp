@@ -1,9 +1,12 @@
 
+from pathlib import Path
+
 import joblib
 import pandas as pd
 
 # Load the saved model
-model = joblib.load("late_delivery_model.joblib")
+model_path = Path(__file__).with_name("late_delivery_model.joblib")
+model = joblib.load(model_path)
 
 # Initial warning threshold
 THRESHOLD = 0.4
